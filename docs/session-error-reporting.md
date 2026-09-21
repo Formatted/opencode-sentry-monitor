@@ -53,6 +53,12 @@ the completed assistant message after idle. Error-only handling never creates a
 parent, and the late completed error message must not reopen a parent through the
 usage path. Deletion and repeated idle/error notifications remain safe.
 
+For a retained idle session, a completed error message still emits its token and
+response-duration metrics when usage processing and metrics are enabled. The
+existing completed-message deduplication prevents repeated updates from counting
+usage twice. No parent or request span is created after idle just to record those
+metrics. Late errors for deleted or unknown sessions remain ignored.
+
 Explicit host cancellation can publish idle *before* the abort error arrives.
 An already-ended span is not rewritten or reopened; in that order it retains its
 original unset status. This is a limitation of the existing span boundary, not

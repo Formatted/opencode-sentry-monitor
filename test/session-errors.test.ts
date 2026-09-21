@@ -34,6 +34,7 @@ let hooks: Hooks;
 let spans: Span[];
 let captures: ReturnType<typeof mock.fn>;
 let flushes: ReturnType<typeof mock.fn>;
+let distributions: ReturnType<typeof mock.fn>;
 let settings: config.ResolvedPluginConfig;
 async function setup(overrides: Partial<config.ResolvedPluginConfig> = {}) {
   settings = {
@@ -72,6 +73,7 @@ beforeEach(async () => {
   });
   captures = mock.method(Sentry, "captureMessage", () => "synthetic");
   flushes = mock.method(Sentry, "flush", async () => true);
+  distributions = mock.method(Sentry.metrics, "distribution", () => undefined);
   mock.method(Sentry, "addBreadcrumb", () => undefined);
   mock.method(console, "info", () => undefined);
   mock.method(console, "warn", () => undefined);
@@ -125,6 +127,86 @@ test("normal run keeps status unset, usage, model and parentage intact", async (
   assert.equal(spans[1].options.parentSpan, spans[0]);
   assert.equal(spans[1].attributes["gen_ai.usage.total_tokens"], 5);
   assert.equal(spans[1].ends, 1);
+});
+
+for (const enableMetrics of [false, true]) {
+  test(`late failed completion preserves metrics=${enableMetrics} without reopening a span`, async () => {
+    settings.enableMetrics = enableMetrics;
+    await start();
+    await error();
+    await idle();
+    const info = {
+      ...assistant("A"),
+      error: failure,
+      time: { created: 100, completed: 150 },
+      tokens: {
+        input: 3,
+        output: 2,
+        reasoning: 1,
+        cache: { read: 4, write: 0 },
+      },
+    } satisfies AssistantMessage;
+    // The host completes the assistant message after the run is already idle.
+    await update(info);
+    await update(info);
+    await idle();
+
+    assert.equal(spans.length, 1);
+    assert.equal(spans[0].ends, 1);
+    assert.equal(spans[0].attributes["error.type"], "APIError");
+    const recorded = distributions.mock.calls.map(({ arguments: args }) => {
+      const [name, value, options] = args as Parameters<
+        typeof Sentry.metrics.distribution
+      >;
+      assert.ok(options?.attributes);
+      assert.equal(options.attributes["gen_ai.request.model"], info.modelID);
+      assert.equal(options.attributes["opencode.model.provider"], info.providerID);
+      return [name, value, options.attributes["gen_ai.token.type"], options.unit];
+    });
+    assert.deepEqual(
+      recorded,
+      enableMetrics
+        ? [
+            ["gen_ai.client.token.usage", 3, "input", "token"],
+            ["gen_ai.client.token.usage", 2, "output", "token"],
+            ["gen_ai.client.token.usage", 1, "reasoning", "token"],
+            ["gen_ai.client.token.usage", 4, "cached_input", "token"],
+            ["gen_ai.client.response.duration", 50, undefined, "millisecond"],
+          ]
+        : [],
+    );
+  });
+}
+
+test("completed failure metrics are not counted again by a late duplicate", async () => {
+  settings.enableMetrics = true;
+  await start();
+  const info = { ...assistant("A"), error: failure };
+  await update(info);
+  assert.equal(distributions.mock.callCount(), 3);
+  await idle();
+  await update(info);
+  assert.equal(distributions.mock.callCount(), 3);
+  assert.equal(parents().length, 1);
+  assert.equal(spans.length, 2);
+  assert.deepEqual(
+    spans.map((span) => span.ends),
+    [1, 1],
+  );
+});
+
+test("late error metrics do not recreate deleted or unknown sessions", async () => {
+  settings.enableMetrics = true;
+  await start();
+  await emit(hooks, {
+    type: "session.deleted",
+    properties: { info: session("A") },
+  });
+  await update({ ...assistant("A"), error: failure });
+  await update({ ...assistant("unknown"), error: failure });
+  assert.equal(distributions.mock.callCount(), 0);
+  assert.equal(spans.length, 1);
+  assert.equal(spans[0].ends, 1);
 });
 
 for (const includeMessageUsageSpans of [false, true]) {

@@ -1107,16 +1107,16 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
 
           case "message.updated": {
             const info = event.properties.info;
-            if (
+            const isFailedAssistantMessage =
               isMessageInfo(info) &&
               info.role === "assistant" &&
               "error" in info &&
-              info.error != null
-            ) {
+              info.error != null;
+            if (isFailedAssistantMessage) {
               markSessionError(info.sessionID, info.error, "message.updated");
-              // The host can publish the completed error message after idle.
-              // It must not reopen the run merely to record usage.
-              if (!sessions.get(info.sessionID)?.sessionSpan) {
+              // Idle sessions retain their usage deduplication state. Deleted or
+              // unknown sessions must not be recreated by a late error message.
+              if (!sessions.has(info.sessionID)) {
                 break;
               }
             }
@@ -1154,31 +1154,36 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
 
             setSessionModel(info.sessionID, info.providerID, info.modelID);
 
-            const parentSessionSpan = ensureSessionSpan(
-              info.sessionID,
-              config,
-              projectName,
-              agentName,
-            );
+            // A completed error message can arrive after idle. Preserve its
+            // metrics below without creating a new parent or an orphan span.
+            const parentSessionSpan = isFailedAssistantMessage
+              ? state.sessionSpan
+              : ensureSessionSpan(info.sessionID, config, projectName, agentName);
 
-            const usageSpan = Sentry.startInactiveSpan({
-              parentSpan: parentSessionSpan,
-              op: "gen_ai.request",
-              name: `request ${info.modelID}`,
-              attributes: {
-                "gen_ai.operation.name": "request",
-                "gen_ai.request.model": info.modelID,
-                "gen_ai.agent.name": agentName,
-                "gen_ai.conversation.id": info.sessionID,
-                "opencode.model.provider": info.providerID,
-                "opencode.session.id": info.sessionID,
-                "opencode.message.id": info.id,
-                "opencode.project.name": projectName,
-                ...config.tags,
-              },
-            });
+            const usageSpan = parentSessionSpan
+              ? Sentry.startInactiveSpan({
+                  parentSpan: parentSessionSpan,
+                  op: "gen_ai.request",
+                  name: `request ${info.modelID}`,
+                  attributes: {
+                    "gen_ai.operation.name": "request",
+                    "gen_ai.request.model": info.modelID,
+                    "gen_ai.agent.name": agentName,
+                    "gen_ai.conversation.id": info.sessionID,
+                    "opencode.model.provider": info.providerID,
+                    "opencode.session.id": info.sessionID,
+                    "opencode.message.id": info.id,
+                    "opencode.project.name": projectName,
+                    ...config.tags,
+                  },
+                })
+              : undefined;
 
-            if (config.recordInputs && typeof info.parentID === "string") {
+            if (
+              usageSpan &&
+              config.recordInputs &&
+              typeof info.parentID === "string"
+            ) {
               const inputText = getMessageText(
                 info.parentID,
                 config.maxAttributeLength,
@@ -1210,7 +1215,7 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
               }
             }
 
-            if (config.recordOutputs) {
+            if (usageSpan && config.recordOutputs) {
               const outputText = getMessageText(
                 info.id,
                 config.maxAttributeLength,
@@ -1233,8 +1238,10 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
               }
             }
 
-            attachTokenUsage(usageSpan, info.tokens);
-            usageSpan.end();
+            if (usageSpan) {
+              attachTokenUsage(usageSpan, info.tokens);
+              usageSpan.end();
+            }
 
             if (config.enableMetrics) {
               const metricAttrs = {
