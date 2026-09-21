@@ -15,6 +15,7 @@ interface SessionState {
   providerID: string;
   modelID: string;
   sessionSpan?: SentrySpan;
+  sessionErrorType?: string;
   completedAssistantMessages: Set<string>;
 }
 
@@ -474,6 +475,70 @@ function setSpanStatus(span: SentrySpan, isError: boolean): void {
   span.setStatus({ code: isError ? 2 : 1 });
 }
 
+// Only bounded OpenCode error names may become telemetry attributes. Unknown
+// named errors use a fixed fallback, never their message or serialized payload.
+function getSessionErrorType(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  const value = error as Record<string, unknown>;
+  if (
+    typeof value.name !== "string" ||
+    !value.data ||
+    typeof value.data !== "object" ||
+    Array.isArray(value.data)
+  ) {
+    return undefined;
+  }
+
+  switch (value.name) {
+    case "ProviderAuthError":
+    case "UnknownError":
+    case "MessageOutputLengthError":
+    case "MessageAbortedError":
+    case "APIError":
+    // The 1.2.16 host emits these even though the plugin's v1 SDK omits them.
+    case "ContextOverflowError":
+    case "StructuredOutputError":
+      return value.name;
+    default:
+      return "UnknownError";
+  }
+}
+
+function markSessionError(
+  sessionID: unknown,
+  error: unknown,
+  source: "session.error" | "message.updated",
+): void {
+  if (typeof sessionID !== "string" || sessionID.length === 0) {
+    return;
+  }
+  const state = sessions.get(sessionID);
+  if (!state?.sessionSpan || state.sessionErrorType) {
+    return;
+  }
+
+  const errorType = getSessionErrorType(error);
+  // session.error also reports recoverable compaction and input-file failures.
+  // For these ambiguous categories, require an assistant error to confirm failure.
+  if (
+    !errorType ||
+    (source === "session.error" &&
+      (errorType === "ContextOverflowError" || errorType === "UnknownError"))
+  ) {
+    return;
+  }
+
+  state.sessionErrorType = errorType;
+  state.sessionSpan.setAttribute("error.type", errorType);
+  state.sessionSpan.setStatus({
+    code: 2,
+    // This identifies an aborted operation, not who initiated the abort.
+    message: errorType === "MessageAbortedError" ? "cancelled" : "unknown_error",
+  });
+}
+
 function ensureSessionSpan(
   sessionID: string,
   config: ResolvedPluginConfig,
@@ -503,6 +568,7 @@ function ensureSessionSpan(
     },
   });
 
+  state.sessionErrorType = undefined;
   state.sessionSpan = sessionSpan;
   return sessionSpan;
 }
@@ -1015,6 +1081,11 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
           }
 
           case "session.error": {
+            markSessionError(
+              event.properties.sessionID,
+              event.properties.error,
+              "session.error",
+            );
             captureSessionError(
               event.properties.sessionID,
               event.properties.error,
@@ -1035,6 +1106,21 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
           }
 
           case "message.updated": {
+            const info = event.properties.info;
+            if (
+              isMessageInfo(info) &&
+              info.role === "assistant" &&
+              "error" in info &&
+              info.error != null
+            ) {
+              markSessionError(info.sessionID, info.error, "message.updated");
+              // The host can publish the completed error message after idle.
+              // It must not reopen the run merely to record usage.
+              if (!sessions.get(info.sessionID)?.sessionSpan) {
+                break;
+              }
+            }
+
             if (
               shouldCacheMessageText &&
               isMessageInfo(event.properties.info)
@@ -1049,12 +1135,15 @@ export const SentryObservabilityPlugin: Plugin = async (input) => {
               break;
             }
 
-            const info = event.properties.info;
             if (!isAssistantMessageInfo(info)) {
               break;
             }
 
-            if (typeof info.time.completed !== "number") {
+            if (
+              typeof info.time.completed !== "number" ||
+              !info.tokens ||
+              typeof info.tokens !== "object"
+            ) {
               break;
             }
 

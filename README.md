@@ -138,10 +138,13 @@ Example config for team attribution:
 ## Local Development
 
 ```bash
-npm install
+npm ci
+npm test
 npm run typecheck
 npm run build
 ```
+
+Tests use Node 22.17.0 or later. See [agent span failure reporting](docs/session-error-reporting.md) for the run boundary, error categories, cancellation policy, and SDK export checks.
 
 ## Publish
 
